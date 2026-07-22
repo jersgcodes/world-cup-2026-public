@@ -1,0 +1,85 @@
+name: WC results auto-update
+
+# Reliable, deterministic results path (no LLM, no API key): pull finished scores +
+# HT + goalscorers from openfootball/worldcup.json, re-sim the markets, re-encrypt the
+# slip, and push to main. Commits only when something changed. The Claude routine then
+# only handles ENRICHMENT (profiles, value) — results no longer depend on it.
+#
+# Optional repo secret: WC_BETS_PASS (the bet-slip passphrase). Without it, the encrypt
+# step is skipped; results + markets still update.
+
+on:
+  # Schedule removed 2026-07-01: the VPS systemd timer (deploy/wc-update.timer) is now the
+  # primary updater — it runs this same pipeline locally every 5 min, free of the private-repo
+  # Actions 2,000-min/mo cap. This workflow stays as a manual / dispatch-only backstop.
+  workflow_dispatch:
+    inputs:
+      reapply:
+        description: 'Re-ingest ALL played fixtures (one-time identity/position/minutes fix)'
+        type: boolean
+        default: false
+  repository_dispatch:
+    types: [ingest]          # external pinger (e.g. cron-job.org) → near-real-time, see scripts/EXTERNAL_TRIGGER.md
+
+permissions:
+  contents: write
+
+concurrency:
+  group: wc-results
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: main, fetch-depth: 0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+
+      - name: Fetch results (openfootball, no key)
+        run: node scripts/fetch_results.mjs
+
+      # Backfill ESPN-summary data the rolling-window pass missed: starting XIs (cron timing /
+      # late XIs), box-score stats, and per-player minutes. Free when there's no backlog.
+      # `reapply` (manual dispatch) re-ingests EVERY played fixture to apply the jersey-number
+      # identity fix + positions + minutes to historical data.
+      - name: Backfill missed lineups + stats + minutes
+        run: node scripts/backfill_lineups.mjs ${{ github.event.inputs.reapply == 'true' && '--reapply' || '' }}
+
+      # Merge duplicate squad rows the old name-only ingestion created (idempotent; no-op once clean).
+      - name: Dedupe squads
+        run: node scripts/dedupe_squads.mjs
+
+      - name: Detect change
+        id: chg
+        run: |
+          if git diff --quiet data.json; then echo "changed=no" >> "$GITHUB_OUTPUT"; else echo "changed=yes" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Re-simulate markets
+        if: steps.chg.outputs.changed == 'yes'
+        run: node scripts/simulate.mjs --write --n 20000
+
+      - name: Re-encrypt bet slip
+        if: steps.chg.outputs.changed == 'yes'
+        env:
+          WC_BETS_PASS: ${{ secrets.WC_BETS_PASS }}
+        run: |
+          # Only the genuinely-optional "no secret set" case is tolerated. A real encrypt error
+          # (bad slip, crypto failure) must FAIL the run — never publish results with a stale betsEnc.
+          git fetch origin bets-private
+          if [ -n "$WC_BETS_PASS" ]; then node scripts/encrypt_bets.mjs; else echo "WC_BETS_PASS not set — skipping encrypt (results/markets still publish)"; fi
+
+      - name: Commit & push
+        if: steps.chg.outputs.changed == 'yes'
+        run: |
+          git config user.name "wc-results-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data.json
+          git commit -m "Auto results update — $(date -u +'%Y-%m-%d %H:%M UTC')"
+          # absorb a concurrent push (human / routine) instead of dying on a stale ref
+          for i in 1 2 3 4 5; do
+            git pull --rebase origin main && git push origin main && exit 0
+            echo "push attempt $i failed (likely a concurrent push) — retrying"; sleep 3
+          done
+          echo "::error::could not push after retries"; exit 1

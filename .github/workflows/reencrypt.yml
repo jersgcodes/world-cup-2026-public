@@ -1,0 +1,48 @@
+name: Re-encrypt slip (manual)
+
+# One-click re-encrypt: fold the current bets-private slip into data.json's betsEnc, no
+# match result required. Use it when you've added/edited bets and want them in the published
+# (encrypted) view immediately. Run from the Actions tab → "Re-encrypt slip (manual)" → Run workflow.
+#
+# Requires the WC_BETS_PASS repo secret (the slip passphrase). Without it the run fails loudly
+# so you know nothing was published.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: wc-results        # share the results group so it can't race the auto results push
+  cancel-in-progress: false
+
+jobs:
+  reencrypt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: main, fetch-depth: 0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+
+      - name: Re-encrypt bet slip from bets-private
+        env:
+          WC_BETS_PASS: ${{ secrets.WC_BETS_PASS }}
+        run: |
+          if [ -z "$WC_BETS_PASS" ]; then echo "::error::WC_BETS_PASS secret not set — cannot encrypt"; exit 1; fi
+          git fetch origin bets-private
+          node scripts/encrypt_bets.mjs
+
+      - name: Commit & push if changed
+        run: |
+          if git diff --quiet data.json; then echo "betsEnc already up to date — nothing to publish"; exit 0; fi
+          git config user.name "wc-results-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data.json
+          git commit -m "Re-encrypt slip (manual) — $(date -u +'%Y-%m-%d %H:%M UTC')"
+          for i in 1 2 3 4 5; do
+            git pull --rebase origin main && git push origin main && exit 0
+            echo "push attempt $i failed (likely a concurrent push) — retrying"; sleep 3
+          done
+          echo "::error::could not push after retries"; exit 1
